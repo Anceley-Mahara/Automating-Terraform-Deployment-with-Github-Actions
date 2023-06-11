@@ -1,5 +1,4 @@
 name: "Terraform"
-
 on:
   push:
     branches:
@@ -12,17 +11,21 @@ jobs:
   terraform:
     name: "Terraform"
     runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    defaults:
+      run:
+        working-directory: Manage Multiple Environments/staging
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v2
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v1
         with:
-          # terraform_version: 0.13.0:
-          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+          terraform_version: 1.0.1
+          terraform_wrapper: false
 
       - name: Terraform Format
         id: fmt
@@ -31,41 +34,30 @@ jobs:
       - name: Terraform Init
         id: init
         run: terraform init
-      
-      - name: Terraform Validate
-        id: validate
-        run: terraform validate -no-color
 
       - name: Terraform Plan
         id: plan
         if: github.event_name == 'pull_request'
-        run: terraform plan -no-color -input=false
+        # Route 53 zone must already exist for this to succeed!
+        run: terraform plan -var db_pass=${{secrets.DB_PASS }} -no-color
         continue-on-error: true
 
-      - name: Update Pull Request
-        uses: actions/github-script@v6
+      - uses: actions/github-script@0.9.0
         if: github.event_name == 'pull_request'
         env:
-          PLAN: ${{ steps.plan.outputs.stdout }}
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
             #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
-            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
             #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
-
             <details><summary>Show Plan</summary>
-
-            \`\`\`terraform\n
-            ${process.env.PLAN}
-            \`\`\`
-
+            \`\`\`${process.env.PLAN}\`\`\`
             </details>
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
 
-            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
-
-            github.rest.issues.createComment({
+            github.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -76,6 +68,38 @@ jobs:
         if: steps.plan.outcome == 'failure'
         run: exit 1
 
-      - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: terraform apply -auto-approve -input=false
+      - uses: actions/setup-go@v2
+        with:
+          go-version: "^1.15.5"
+
+      - name: Terratest Execution
+        if: github.event_name == 'pull_request'
+        working-directory: 08-testing/tests/terratest
+        run: |
+          go test . -v timeout 10m
+
+      - name: Check tag
+        id: check-tag
+        run: |
+          if [[ ${{ github.ref }} =~ ^refs\/tags\/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo ::set-output name=environment::production
+          elif [[ ${{ github.ref }} == 'refs/heads/main' ]]; then echo ::set-output name=environment::staging
+          else echo ::set-output name=environment::unknown
+          fi
+
+      - name: Terraform Apply Global
+        if: github.event_name == 'push' || github.event_name == 'release'
+        working-directory: 07-managing-multiple-environments/file-structure/global
+        run: |
+          terraform init
+          terraform apply -auto-approve
+
+      - name: Terraform Apply Staging
+        if: steps.check-tag.outputs.environment == 'staging' && github.event_name == 'push'
+        run: terraform apply -var db_pass=${{secrets.DB_PASS }} -auto-approve
+
+      - name: Terraform Apply Production
+        if: steps.check-tag.outputs.environment == 'production' && github.event_name == 'release'
+        working-directory: 07-managing-multiple-environments/file-structure/production
+        run: |
+          terraform init
+          terraform apply -var db_pass=${{secrets.DB_PASS }} -auto-approve
