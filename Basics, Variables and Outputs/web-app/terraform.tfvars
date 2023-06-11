@@ -1,0 +1,5 @@
+bucket_prefix = "demo-web-app-data"
+domain        = ""
+db_name       = "mydb"
+db_user       = "admin"
+# db_pass = "foobarbaz"
